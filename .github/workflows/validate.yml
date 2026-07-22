@@ -15,13 +15,16 @@ jobs:
       - name: Check browser JavaScript
         run: node --check app.js
       - name: Check Apps Script JavaScript
-        run: cp Code.gs /tmp/Code.js && node --check /tmp/Code.js
+        run: |
+          cp Code.gs /tmp/Code.js
+          cp Questions.gs /tmp/Questions.js
+          node --check /tmp/Code.js
+          node --check /tmp/Questions.js
       - name: Ensure no private roster is committed
         shell: bash
         run: |
-          if grep -Eq "STUDENT_ROSTER|20260722134722|10y7CX6hG6fwp71j_0hx1UbeL5gaB-5JXkVZELsJrDoA" Code.gs README.md; then
+          if grep -Eq "STUDENT_ROSTER|20260722134722|10y7CX6hG6fwp71j_0hx1UbeL5gaB-5JXkVZELsJrDoA" Code.gs Questions.gs README.md; then
             echo "Private roster or deployment identifier found"
             exit 1
           fi
-
 
