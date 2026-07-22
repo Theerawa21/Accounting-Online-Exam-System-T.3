@@ -1,0 +1,597 @@
+<script>
+(() => {
+  'use strict';
+
+  const APP = document.getElementById('app');
+  const LETTERS = ['ก', 'ข', 'ค', 'ง'];
+  const ATTEMPT_KEY = 'accountingExamAttemptToken';
+  const TEACHER_KEY = 'accountingExamTeacherToken';
+  const IS_DEMO = !window.google?.script?.run && new URLSearchParams(location.search).get('demo') === '1';
+  const state = {
+    screen: 'boot', attempt: null, answers: {}, index: 0, result: null,
+    teacherToken: sessionStorage.getItem(TEACHER_KEY) || '', dashboard: null,
+    filters: { query: '', room: 'all', setNumber: 0 },
+    saveStatus: 'saved', submitting: false, studentLookup: null
+  };
+  let timerId = 0;
+  let autosaveId = 0;
+  let saveTimer = 0;
+  let filterTimer = 0;
+  let lookupTimer = 0;
+  let lookupRequest = 0;
+
+  const icons = {
+    clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+    user: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>',
+    check: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4L19 6"/></svg>',
+    cloud: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18h10a4 4 0 0 0 .4-8 6 6 0 0 0-11.5-1.4A4.8 4.8 0 0 0 7 18Z"/><path d="m9 13 2 2 4-4"/></svg>',
+    search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>',
+    download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>',
+    arrowLeft: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>',
+    arrowRight: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>',
+    logout: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H5v14h5M14 8l4 4-4 4m4-4H9"/></svg>'
+  };
+
+  const esc = value => String(value ?? '').replace(/[&<>'"]/g, char => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  })[char]);
+
+  function logo(compact = false) {
+    return `<div class="brandmark ${compact ? 'compact' : ''}" aria-label="St. Theresa School">
+      <span class="brandmark-st">ST</span><span class="brandmark-line"></span>
+    </div>`;
+  }
+
+  function publicHeader(action = '') {
+    return `<header class="public-header"><div class="public-header__inner">
+      <a class="brand" href="#" data-action="home">${logo(true)}
+        <span><strong>Accounting Fundamentals</strong><small>ระบบสอบออนไลน์ วิชาการบัญชีเบื้องต้น</small></span>
+      </a>${action}</div></header>`;
+  }
+
+  function page(content, className = '') {
+    APP.innerHTML = `<div class="app-page ${className}">${content}
+      <footer>โรงเรียนเซนต์เทเรซา · ชั้นมัธยมศึกษาปีที่ 4/3 และ 4/4</footer>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+      <div id="modalRoot"></div></div>`;
+    document.querySelectorAll('[data-action="home"]').forEach(el => {
+      el.addEventListener('click', event => {
+        event.preventDefault();
+        if (!state.attempt) { state.screen = 'login'; render(); }
+      });
+    });
+  }
+
+  function render() {
+    clearInterval(timerId);
+    if (state.screen !== 'exam') { clearInterval(autosaveId); autosaveId = 0; }
+    if (state.screen === 'boot') return renderBoot();
+    if (state.screen === 'setup') return renderSetup();
+    if (state.screen === 'login') return renderLogin();
+    if (state.screen === 'exam') return renderExam();
+    if (state.screen === 'result') return renderResult();
+    if (state.screen === 'teacherLogin') return renderTeacherLogin();
+    if (state.screen === 'admin') return renderAdmin();
+  }
+
+  function renderBoot() {
+    page(`<main class="center-stage"><div class="loader-card">${logo()}<div class="spinner"></div>
+      <h1>กำลังเตรียมระบบสอบ</h1><p>กำลังตรวจสอบข้อมูลการสอบล่าสุด…</p></div></main>`, 'boot-page');
+  }
+
+  function renderSetup() {
+    page(`${publicHeader()}<main class="center-stage"><section class="setup-card">
+      <div class="setup-icon">${icons.lock}</div><h1>เปิดผ่าน Google Apps Script Web App</h1>
+      <p>หน้านี้ต้องทำงานผ่าน URL ที่ได้จากการ Deploy เพื่อเชื่อมกับ Google Sheet และตรวจสิทธิ์อย่างปลอดภัย</p>
+      <div class="setup-code">ทดสอบหน้าจอในเครื่อง: เติม <strong>?demo=1</strong> ต่อท้าย URL</div>
+    </section></main>`);
+  }
+
+  function renderLogin() {
+    state.studentLookup = null;
+    const teacherAction = `<button class="header-link" id="teacherEntry">${icons.lock}<span>สำหรับครู</span></button>`;
+    page(`${publicHeader(teacherAction)}
+      <main class="login-layout">
+        <section class="login-intro">
+          <div class="crest-wrap">${logo()}</div>
+          <h1>พร้อมสำหรับ<br><span>การสอบบัญชีเบื้องต้น</span></h1>
+          <p>แบบทดสอบปรนัย 4 ตัวเลือก ระบบจะสุ่มข้อสอบ 1 จาก 5 ชุด พร้อมสลับลำดับข้อและตัวเลือกเฉพาะบุคคล</p>
+          <div class="exam-facts" aria-label="รายละเอียดการสอบ">
+            <div><strong>40</strong><span>ข้อ</span></div><i></i>
+            <div><strong>40</strong><span>นาที</span></div><i></i>
+            <div><strong>40</strong><span>คะแนน</span></div>
+          </div>
+          <div class="equation-line">สินทรัพย์ = หนี้สิน + ส่วนของเจ้าของ</div>
+        </section>
+        <section class="login-panel">
+          <div class="panel-heading"><h2>ข้อมูลผู้เข้าสอบ</h2><p>กรอกเลขประจำตัว แล้วระบบจะแสดงข้อมูลจากทะเบียนอัตโนมัติ</p></div>
+          <form id="studentForm" novalidate>
+            <div class="field lookup-field" id="lookupField"><label for="studentId">เลขประจำตัวนักเรียน</label>
+              <div class="lookup-input"><input id="studentId" name="studentId" inputmode="numeric" pattern="[0-9]*" autocomplete="off" maxlength="12" placeholder="กรอกเลขประจำตัว" aria-describedby="lookupFeedback" required><span id="lookupSpinner" class="lookup-spinner" aria-hidden="true"></span></div>
+              <p id="lookupFeedback" class="lookup-feedback" role="status" aria-live="polite">กรอกเลขประจำตัวอย่างน้อย 4 หลัก</p></div>
+            <div class="field auto-field"><label for="fullName">ชื่อ–นามสกุล <span>จากทะเบียน</span></label>
+              <input id="fullName" name="fullName" placeholder="จะแสดงอัตโนมัติ" readonly tabindex="-1"></div>
+            <div class="form-row">
+              <div class="field auto-field"><label for="number">เลขที่</label>
+                <input id="number" name="number" placeholder="—" readonly tabindex="-1"></div>
+              <div class="field auto-field"><label for="room">ห้องเรียน</label>
+                <input id="room" name="room" placeholder="—" readonly tabindex="-1"></div>
+            </div>
+            <label class="consent"><input type="checkbox" id="consent" required disabled><span>ข้าพเจ้าตรวจสอบข้อมูลแล้ว และเข้าใจว่าส่งข้อสอบได้เพียงครั้งเดียว</span></label>
+            <div id="formError" class="form-error" role="alert"></div>
+            <button class="btn btn-primary btn-wide btn-large" type="submit" disabled><span>เริ่มทำข้อสอบ</span>${icons.arrowRight}</button>
+          </form>
+          <p class="secure-note">${icons.lock}<span>ข้อมูลและคำตอบจะบันทึกลงฐานข้อมูลกลางของโรงเรียน</span></p>
+        </section>
+      </main>`, 'login-page');
+
+    document.getElementById('teacherEntry').addEventListener('click', () => {
+      state.screen = 'teacherLogin'; render();
+    });
+    document.getElementById('studentForm').addEventListener('submit', startExam);
+    document.getElementById('studentId').addEventListener('input', queueStudentLookup);
+  }
+
+  function setLookupState(message, tone = 'idle') {
+    const feedback = document.getElementById('lookupFeedback');
+    const field = document.getElementById('lookupField');
+    const spinner = document.getElementById('lookupSpinner');
+    if (!feedback || !field || !spinner) return;
+    feedback.textContent = message;
+    field.dataset.state = tone;
+    spinner.classList.toggle('visible', tone === 'loading');
+  }
+
+  function clearStudentDetails() {
+    state.studentLookup = null;
+    ['fullName', 'number', 'room'].forEach(id => { document.getElementById(id).value = ''; });
+    const consent = document.getElementById('consent');
+    const button = document.querySelector('#studentForm button[type="submit"]');
+    consent.checked = false;
+    consent.disabled = true;
+    button.disabled = true;
+  }
+
+  function fillStudentDetails(student) {
+    state.studentLookup = student;
+    document.getElementById('fullName').value = student.fullName;
+    document.getElementById('number').value = student.number;
+    document.getElementById('room').value = student.room;
+    document.getElementById('consent').disabled = false;
+    document.querySelector('#studentForm button[type="submit"]').disabled = false;
+    setLookupState('พบข้อมูลนักเรียนแล้ว กรุณาตรวจสอบก่อนเริ่มสอบ', 'success');
+  }
+
+  function queueStudentLookup(event) {
+    const input = event.currentTarget;
+    const digits = input.value.replace(/\D/g, '').slice(0, 12);
+    if (input.value !== digits) input.value = digits;
+    clearTimeout(lookupTimer);
+    lookupRequest += 1;
+    clearStudentDetails();
+    document.getElementById('formError').classList.remove('visible');
+    if (digits.length < 4) {
+      setLookupState('กรอกเลขประจำตัวอย่างน้อย 4 หลัก');
+      return;
+    }
+    const request = lookupRequest;
+    setLookupState('กำลังค้นหาข้อมูลจากทะเบียน…', 'loading');
+    lookupTimer = setTimeout(async () => {
+      try {
+        const student = await rpc('lookupStudent', digits);
+        if (request !== lookupRequest || input.value !== digits) return;
+        fillStudentDetails(student);
+      } catch (error) {
+        if (request !== lookupRequest || input.value !== digits) return;
+        setLookupState(messageOf(error), 'error');
+      }
+    }, 350);
+  }
+
+  async function startExam(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector('button[type="submit"]');
+    const error = document.getElementById('formError');
+    const typedId = form.elements.studentId.value;
+    if (!state.studentLookup || state.studentLookup.studentId !== typedId) return showFormError(error, 'กรุณารอให้ระบบตรวจพบข้อมูลนักเรียนก่อนเริ่มสอบ');
+    if (!document.getElementById('consent').checked) return showFormError(error, 'กรุณายืนยันข้อมูลก่อนเริ่มสอบ');
+    const payload = { ...state.studentLookup };
+    error.classList.remove('visible');
+    setButtonBusy(button, true, 'กำลังสร้างข้อสอบ…');
+    try {
+      enterAttempt(await rpc('startExam', payload));
+    } catch (err) {
+      showFormError(error, messageOf(err));
+      setButtonBusy(button, false);
+    }
+  }
+
+  function enterAttempt(attempt) {
+    state.attempt = attempt;
+    state.answers = attempt.answers || {};
+    state.index = 0;
+    state.screen = 'exam';
+    localStorage.setItem(ATTEMPT_KEY, attempt.token);
+    render();
+  }
+
+  function renderExam() {
+    const a = state.attempt;
+    const q = a.questions[state.index];
+    const answered = Object.keys(state.answers).length;
+    const pct = answered / a.questions.length * 100;
+    const saveLabel = state.saveStatus === 'saving' ? 'กำลังบันทึก…' : state.saveStatus === 'error' ? 'รอบันทึกใหม่' : 'บันทึกอัตโนมัติแล้ว';
+    page(`<header class="exam-header">
+      <div class="exam-brand">${logo(true)}<span><strong>Accounting Fundamentals</strong><small>โรงเรียนเซนต์เทเรซา · วิชาการบัญชีเบื้องต้น</small></span></div>
+      <div class="time-block"><span>${icons.clock} เวลาที่เหลือ</span><strong id="timer">${formatRemaining()}</strong></div>
+      <div class="student-block">${icons.user}<span><strong>${esc(a.student.fullName)}</strong><small>เลขที่ ${esc(a.student.number)} · ${esc(a.student.room)} · ชุด ${a.setNumber}</small></span></div>
+    </header>
+    <div class="exam-status"><div class="answered-status">${icons.check}<span>ตอบแล้ว <strong>${answered}</strong> จาก ${a.questions.length} ข้อ</span>
+      <div class="progress-track"><i style="width:${pct}%"></i></div></div>
+      <div class="save-status ${state.saveStatus}">${icons.cloud}<span>${saveLabel}</span></div></div>
+    <main class="exam-layout">
+      <section class="question-card">
+        <div class="question-meta"><span>ข้อที่ <strong>${state.index + 1}</strong> จาก ${a.questions.length}</span><span>เลือกคำตอบที่ถูกต้องที่สุด 1 ข้อ</span></div>
+        <h1>${esc(q.text)}</h1>
+        <fieldset class="choices"><legend class="sr-only">ตัวเลือกคำตอบ</legend>
+          ${q.options.map((option, index) => `<label class="choice ${Number(state.answers[q.id]) === index ? 'selected' : ''}">
+            <input type="radio" name="answer" value="${index}" ${Number(state.answers[q.id]) === index ? 'checked' : ''}>
+            <span class="choice-letter">${LETTERS[index]}</span><span class="choice-text">${esc(option)}</span>
+          </label>`).join('')}
+        </fieldset>
+        <div class="question-actions">
+          <button class="btn btn-outline" id="prevQuestion" ${state.index === 0 ? 'disabled' : ''}>${icons.arrowLeft}<span>ข้อก่อนหน้า</span></button>
+          <button class="btn btn-teal" id="nextQuestion"><span>${state.index === a.questions.length - 1 ? 'ตรวจสอบคำตอบ' : 'ข้อต่อไป'}</span>${icons.arrowRight}</button>
+        </div>
+      </section>
+      <aside class="navigator-card">
+        <button class="navigator-toggle" id="toggleNavigator" type="button" aria-expanded="false" aria-controls="navigatorBody">
+          <span><strong>รายการข้อสอบ</strong><small>ตอบแล้ว ${answered} จาก ${a.questions.length} ข้อ</small></span>
+          <span class="navigator-chevron" aria-hidden="true">⌄</span>
+        </button>
+        <div class="navigator-heading"><h2>คำถามทั้งหมด</h2><div class="legend"><span><i class="done"></i>ตอบแล้ว</span><span><i class="current"></i>กำลังทำ</span><span><i></i>ยังไม่ตอบ</span></div></div>
+        <div class="navigator-body" id="navigatorBody">
+          <div class="question-grid">${a.questions.map((item, index) => `<button class="question-number ${Object.prototype.hasOwnProperty.call(state.answers, item.id) ? 'done' : ''} ${index === state.index ? 'current' : ''}" data-index="${index}" aria-label="ไปข้อ ${index + 1}">${index + 1}</button>`).join('')}</div>
+          <p class="navigator-help">เลือกหมายเลขข้อเพื่อกลับไปตรวจสอบหรือแก้ไขคำตอบ</p>
+        </div>
+        <button class="btn btn-gold btn-wide" id="submitExam">ส่งข้อสอบ</button>
+        <p class="submit-warning">${icons.lock}<span>เมื่อส่งแล้วจะไม่สามารถกลับมาแก้ไขได้</span></p>
+      </aside>
+    </main>`, 'exam-page');
+
+    document.querySelectorAll('input[name="answer"]').forEach(input => {
+      input.addEventListener('change', () => {
+        state.answers[q.id] = Number(input.value);
+        queueSave();
+        refreshAnswerUi(q.id, Number(input.value));
+      });
+    });
+    document.querySelectorAll('.question-number').forEach(button => {
+      button.addEventListener('click', () => { state.index = Number(button.dataset.index); renderExam(); });
+    });
+    document.getElementById('prevQuestion').addEventListener('click', () => {
+      if (state.index > 0) { state.index -= 1; renderExam(); }
+    });
+    document.getElementById('nextQuestion').addEventListener('click', () => {
+      if (state.index < a.questions.length - 1) { state.index += 1; renderExam(); } else openSubmitReview();
+    });
+    document.getElementById('toggleNavigator').addEventListener('click', event => {
+      const card = event.currentTarget.closest('.navigator-card');
+      const expanded = card.classList.toggle('expanded');
+      event.currentTarget.setAttribute('aria-expanded', String(expanded));
+    });
+    document.getElementById('submitExam').addEventListener('click', openSubmitReview);
+    startCountdown();
+    if (!autosaveId) autosaveId = window.setInterval(saveNow, 15000);
+  }
+
+  function refreshAnswerUi(questionId, selectedIndex) {
+    document.querySelectorAll('.choice').forEach((label, index) => label.classList.toggle('selected', index === selectedIndex));
+    const answered = Object.keys(state.answers).length;
+    const status = document.querySelector('.answered-status span');
+    if (status) status.innerHTML = `ตอบแล้ว <strong>${answered}</strong> จาก ${state.attempt.questions.length} ข้อ`;
+    const progress = document.querySelector('.progress-track i');
+    if (progress) progress.style.width = `${answered / state.attempt.questions.length * 100}%`;
+    const navButton = document.querySelector(`.question-number[data-index="${state.index}"]`);
+    if (navButton && Object.prototype.hasOwnProperty.call(state.answers, questionId)) navButton.classList.add('done');
+    updateSaveStatus();
+  }
+
+  function startCountdown() {
+    clearInterval(timerId);
+    updateTimer();
+    timerId = window.setInterval(updateTimer, 1000);
+  }
+
+  function updateTimer() {
+    const el = document.getElementById('timer');
+    if (el) el.textContent = formatRemaining();
+    if (remainingSeconds() <= 0 && !state.submitting) submitCurrent(true);
+  }
+
+  function remainingSeconds() {
+    return Math.max(0, Math.ceil((new Date(state.attempt.deadline).getTime() - Date.now()) / 1000));
+  }
+
+  function formatRemaining() {
+    const seconds = remainingSeconds();
+    return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  function queueSave() {
+    state.saveStatus = 'saving';
+    clearTim…724 tokens truncated…();
+  }
+
+  function renderResult() {
+    const r = state.result;
+    page(`${publicHeader()}<main class="center-stage result-stage"><section class="result-card">
+      <div class="success-mark">${icons.check}</div><h1>ส่งข้อสอบเรียบร้อยแล้ว</h1>
+      <p>${esc(r.fullName)} · เลขที่ ${esc(r.number)} · ${esc(r.room)}</p>
+      <div class="score-ring" style="--score:${Number(r.percent).toFixed(0)}"><div><strong>${r.score}</strong><span>/ ${r.total} คะแนน</span></div></div>
+      <div class="result-details"><div><span>ชุดข้อสอบ</span><strong>ชุด ${r.setNumber}</strong></div>
+        <div><span>เวลาที่ใช้</span><strong>${formatDuration(r.durationSeconds)}</strong></div>
+        <div><span>เวลาส่ง</span><strong>${formatDate(r.submittedAt)}</strong></div></div>
+      ${r.autoSubmitted ? '<div class="auto-note">ระบบส่งคำตอบให้อัตโนมัติเมื่อหมดเวลา</div>' : ''}
+      <p class="result-note">ระบบบันทึกผลลงฐานข้อมูลกลางแล้ว กรุณาแจ้งครูผู้สอนก่อนปิดหน้านี้</p>
+      <button class="btn btn-primary" id="resultHome">กลับหน้าหลัก</button>
+    </section></main>`, 'result-page');
+    document.getElementById('resultHome').addEventListener('click', () => {
+      state.result = null; state.screen = 'login'; render();
+    });
+  }
+
+  function renderTeacherLogin() {
+    page(`${publicHeader(`<button class="header-link" id="studentEntry">${icons.arrowLeft}<span>กลับหน้าสอบ</span></button>`)}
+      <main class="center-stage teacher-login-stage"><section class="teacher-login-card">
+        <div class="teacher-lock">${icons.lock}</div><h1>เข้าสู่ระบบสำหรับครู</h1>
+        <p>กรอกรหัสผ่านเพื่อดูและส่งออกผลการสอบ</p>
+        <form id="teacherForm"><div class="field"><label for="teacherPin">รหัสผ่านครู</label>
+          <input id="teacherPin" type="password" autocomplete="current-password" minlength="8" placeholder="••••••••" required></div>
+          <div id="teacherError" class="form-error" role="alert"></div>
+          <button class="btn btn-primary btn-wide" type="submit">เข้าสู่ระบบ</button></form>
+        <div class="security-copy">${icons.lock}<span>ตรวจสอบรหัสและสร้างเซสชันที่ฝั่งเซิร์ฟเวอร์</span></div>
+      </section></main>`, 'teacher-login-page');
+    document.getElementById('studentEntry').addEventListener('click', () => { state.screen = 'login'; render(); });
+    document.getElementById('teacherForm').addEventListener('submit', teacherLogin);
+  }
+
+  async function teacherLogin(event) {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector('button');
+    const errorEl = document.getElementById('teacherError');
+    setButtonBusy(button, true, 'กำลังตรวจสอบ…');
+    try {
+      const response = await rpc('teacherLogin', document.getElementById('teacherPin').value);
+      state.teacherToken = response.token;
+      sessionStorage.setItem(TEACHER_KEY, response.token);
+      state.screen = 'admin';
+      await loadDashboard(true);
+    } catch (error) {
+      showFormError(errorEl, messageOf(error));
+      setButtonBusy(button, false);
+    }
+  }
+
+  async function loadDashboard(showLoading = false) {
+    if (showLoading) {
+      state.dashboard = null;
+      page(`<main class="center-stage"><div class="loader-card"><div class="spinner"></div><h1>กำลังโหลดผลการสอบ</h1></div></main>`);
+    }
+    try {
+      state.dashboard = await rpc('getTeacherDashboard', state.teacherToken, state.filters);
+      state.screen = 'admin';
+      render();
+    } catch (error) {
+      sessionStorage.removeItem(TEACHER_KEY);
+      state.teacherToken = '';
+      state.screen = 'teacherLogin';
+      render();
+      setTimeout(() => toast(messageOf(error), 'error'), 0);
+    }
+  }
+
+  function renderAdmin() {
+    const data = state.dashboard || { rows: [], summary: { shown: 0, total: 0, average: 0, autoSubmitted: 0 }, syncedAt: new Date().toISOString() };
+    page(`<div class="admin-shell">
+      <aside class="admin-sidebar">
+        <div class="sidebar-brand">${logo(true)}<span><strong>Accounting<br>Fundamentals</strong><small>Teacher Console</small></span></div>
+        <nav><button class="active"><span class="nav-dot"></span>ผลการสอบ</button></nav>
+        <div class="sidebar-school"><strong>โรงเรียนเซนต์เทเรซา</strong><span>ปีการศึกษา 2569</span></div>
+        <button class="sidebar-logout" id="teacherLogout">${icons.logout}<span>ออกจากระบบ</span></button>
+      </aside>
+      <main class="admin-main">
+        <header class="admin-header"><div><h1>ผลการสอบ</h1><p>วิชาการบัญชีเบื้องต้น · ม.4/3 และ ม.4/4</p></div>
+          <div class="sync-time">${icons.cloud}<span>ซิงก์ล่าสุด<br><strong>${formatDateTime(data.syncedAt)}</strong></span></div></header>
+        <section class="summary-band">
+          <div><span>ผลทั้งหมด</span><strong>${data.summary.total}</strong><small>รายการ</small></div>
+          <div><span>แสดงตามตัวกรอง</span><strong>${data.summary.shown}</strong><small>รายการ</small></div>
+          <div><span>คะแนนเฉลี่ย</span><strong>${Number(data.summary.average).toFixed(1)}</strong><small>/ 40</small></div>
+          <div><span>ส่งอัตโนมัติ</span><strong>${data.summary.autoSubmitted}</strong><small>คน</small></div>
+        </section>
+        <section class="results-surface">
+          <div class="results-toolbar">
+            <label class="search-box">${icons.search}<input id="resultSearch" value="${esc(state.filters.query)}" placeholder="ค้นหาเลขประจำตัว ชื่อ หรือเลขที่"></label>
+            <div class="filter-group"><select id="roomFilter"><option value="all">ทุกห้อง</option><option ${state.filters.room === 'ม.4/3' ? 'selected' : ''}>ม.4/3</option><option ${state.filters.room === 'ม.4/4' ? 'selected' : ''}>ม.4/4</option></select>
+            <select id="setFilter"><option value="0">ทุกชุด</option>${[1,2,3,4,5].map(n => `<option value="${n}" ${Number(state.filters.setNumber) === n ? 'selected' : ''}>ชุด ${n}</option>`).join('')}</select></div>
+            <div class="export-group"><button class="btn btn-outline btn-small" id="exportCsv">${icons.download}CSV</button>
+            <button class="btn btn-teal btn-small" id="exportExcel">${icons.download}Excel</button></div>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>ลำดับ</th><th>เลขประจำตัว</th><th>ชื่อ–นามสกุล</th><th>เลขที่</th><th>ห้อง</th><th>ชุด</th><th>คะแนน</th><th>เวลาที่ใช้</th><th>วัน–เวลาส่ง</th></tr></thead>
+          <tbody>${data.rows.length ? data.rows.map((row, index) => `<tr><td>${index + 1}</td><td class="mono">${esc(row.studentId)}</td><td><strong>${esc(row.fullName)}</strong></td><td>${esc(row.number)}</td><td>${esc(row.room)}</td><td>ชุด ${row.setNumber}</td><td><span class="score-cell">${row.score}/${row.total}</span></td><td>${formatDuration(row.durationSeconds)}</td><td>${formatDateTime(row.submittedAt)}${row.autoSubmitted ? '<small class="auto-label">ส่งอัตโนมัติ</small>' : ''}</td></tr>`).join('') : `<tr><td colspan="9"><div class="empty-table">${icons.search}<strong>ไม่พบข้อมูลผลการสอบ</strong><span>ลองปรับคำค้นหาหรือตัวกรอง</span></div></td></tr>`}</tbody></table></div>
+          <div class="table-footer">แสดง ${data.rows.length} จาก ${data.summary.total} รายการ</div>
+        </section>
+      </main>
+    </div>`, 'admin-page');
+    document.getElementById('resultSearch').addEventListener('input', event => {
+      state.filters.query = event.target.value;
+      clearTimeout(filterTimer); filterTimer = setTimeout(() => loadDashboard(false), 350);
+    });
+    document.getElementById('roomFilter').addEventListener('change', event => { state.filters.room = event.target.value; loadDashboard(false); });
+    document.getElementById('setFilter').addEventListener('change', event => { state.filters.setNumber = Number(event.target.value); loadDashboard(false); });
+    document.getElementById('exportCsv').addEventListener('click', () => exportRows('csv'));
+    document.getElementById('exportExcel').addEventListener('click', () => exportRows('excel'));
+    document.getElementById('teacherLogout').addEventListener('click', logoutTeacher);
+  }
+
+  async function logoutTeacher() {
+    try { await rpc('teacherLogout', state.teacherToken); } catch (error) {}
+    sessionStorage.removeItem(TEACHER_KEY);
+    state.teacherToken = '';
+    state.dashboard = null;
+    state.screen = 'login';
+    render();
+  }
+
+  function exportRows(type) {
+    const rows = state.dashboard?.rows || [];
+    if (!rows.length) return toast('ไม่มีข้อมูลสำหรับส่งออก', 'error');
+    const headers = ['ลำดับ','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','คะแนน','คะแนนเต็ม','ร้อยละ','เวลาที่ใช้ (วินาที)','วัน–เวลาส่ง','ส่งอัตโนมัติ'];
+    const values = rows.map((r, i) => [i + 1, r.studentId, r.fullName, r.number, r.room, r.setNumber, r.score, r.total, r.percent, r.durationSeconds, formatDateTime(r.submittedAt), r.autoSubmitted ? 'ใช่' : 'ไม่ใช่']);
+    if (type === 'csv') {
+      const csv = [headers, ...values].map(row => row.map(value => `"${String(value).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+      downloadBlob('\ufeff' + csv, 'text/csv;charset=utf-8', 'คะแนนสอบบัญชีเบื้องต้น.csv');
+    } else {
+      const table = `<table><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${values.map(row => `<tr>${row.map(v => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+      downloadBlob('\ufeff<html><head><meta charset="utf-8"></head><body>' + table + '</body></html>', 'application/vnd.ms-excel;charset=utf-8', 'คะแนนสอบบัญชีเบื้องต้น.xls');
+    }
+  }
+
+  function downloadBlob(content, type, filename) {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const anchor = Object.assign(document.createElement('a'), { href: url, download: filename });
+    document.body.appendChild(anchor); anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 500);
+  }
+
+  function showModal(content, closable = true) {
+    const root = document.getElementById('modalRoot');
+    root.innerHTML = `<div class="modal-backdrop" role="dialog" aria-modal="true"><div class="modal-card">${content}</div></div>`;
+    if (closable) root.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', closeModal));
+  }
+  function closeModal() { const root = document.getElementById('modalRoot'); if (root) root.innerHTML = ''; }
+  function toast(message, tone = '') {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = message; el.className = `toast show ${tone}`;
+    setTimeout(() => { el.className = 'toast'; }, 3500);
+  }
+  function setButtonBusy(button, busy, label = '') {
+    if (busy) {
+      button.dataset.label = button.innerHTML; button.disabled = true;
+      button.innerHTML = `<span class="mini-spinner"></span>${label}`;
+    } else {
+      button.disabled = false;
+      if (button.dataset.label) button.innerHTML = button.dataset.label;
+    }
+  }
+  function showFormError(el, message) { el.textContent = message; el.classList.add('visible'); }
+  function messageOf(error) { return error?.message || String(error || 'เกิดข้อผิดพลาด กรุณาลองใหม่'); }
+  function formatDuration(seconds) {
+    seconds = Number(seconds || 0);
+    return `${Math.floor(seconds / 60)} นาที ${seconds % 60} วินาที`;
+  }
+  function formatDate(value) {
+    return new Intl.DateTimeFormat('th-TH', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Bangkok' }).format(new Date(value));
+  }
+  function formatDateTime(value) {
+    return new Intl.DateTimeFormat('th-TH', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Bangkok' }).format(new Date(value));
+  }
+
+  function rpc(name, ...args) {
+    if (IS_DEMO) return mockRpc(name, ...args);
+    if (!window.google?.script?.run) return Promise.reject(new Error('กรุณาเปิดระบบผ่าน URL ของ Google Apps Script Web App'));
+    return new Promise((resolve, reject) => {
+      const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+      runner[name](...args);
+    });
+  }
+
+  const mock = { attempt: null };
+  function mockQuestions() {
+    const stems = [
+      'ข้อใดอธิบายความหมายของสินทรัพย์ได้ถูกต้องที่สุด',
+      'กิจการซื้ออุปกรณ์สำนักงานเป็นเงินสด รายการนี้มีผลต่อสมการบัญชีอย่างไร',
+      'รายการ “เจ้าหนี้การค้า” จัดอยู่ในประเภทใด',
+      'ธุรกิจประเภทใดมีเจ้าของเพียงคนเดียว',
+      'หลักการเขียนจำนวนเงินทางบัญชีข้อใดถูกต้อง'
+    ];
+    const choices = [
+      ['ทรัพยากรที่กิจการควบคุมและคาดว่าจะให้ประโยชน์ในอนาคต','ภาระผูกพันที่ต้องชำระ','รายได้จากการขายสินค้า','เงินที่เจ้าของถอนใช้'],
+      ['สินทรัพย์ชนิดหนึ่งเพิ่ม อีกชนิดหนึ่งลด','สินทรัพย์และหนี้สินเพิ่ม','สินทรัพย์และทุนลด','หนี้สินเพิ่มและทุนลด'],
+      ['หนี้สินหมุนเวียน','สินทรัพย์หมุนเวียน','ส่วนของเจ้าของ','รายได้'],
+      ['กิจการเจ้าของคนเดียว','บริษัทมหาชนจำกัด','ห้างหุ้นส่วนจำกัด','สหกรณ์'],
+      ['เขียนตัวเลขให้หลักตรงกัน','ใช้ดินสอเพื่อแก้ไขง่าย','เว้นช่องสตางค์ว่างเสมอ','เขียนจำนวนติดขอบขวาโดยไม่ใส่จุลภาค']
+    ];
+    return Array.from({ length: 40 }, (_, i) => ({ id: `demo-${i}`, text: stems[i % stems.length], options: choices[i % choices.length] }));
+  }
+  async function mockRpc(name, ...args) {
+    await new Promise(resolve => setTimeout(resolve, 160));
+    if (name === 'lookupStudent') {
+      if (String(args[0]) !== '99999') throw new Error('ไม่พบเลขประจำตัวนี้ในทะเบียน (โหมดสาธิตใช้ 99999)');
+      return { studentId: '99999', fullName: 'นักเรียน ตัวอย่าง', number: '18', room: 'ม.4/3' };
+    }
+    if (name === 'startExam') {
+      const s = args[0];
+      mock.attempt = { token: 'demo-token', student: s, setNumber: 3, startedAt: new Date().toISOString(), deadline: new Date(Date.now() + 40 * 60000).toISOString(), answers: {}, questions: mockQuestions() };
+      return mock.attempt;
+    }
+    if (name === 'resumeExam') return null;
+    if (name === 'saveAnswers') return { ok: true, answered: Object.keys(args[1] || {}).length };
+    if (name === 'submitExam') {
+      const a = mock.attempt;
+      const score = Object.keys(args[1] || {}).length;
+      return { ...a.student, setNumber: a.setNumber, score, total: 40, percent: score * 2.5, durationSeconds: 617, submittedAt: new Date().toISOString(), autoSubmitted: args[2] === true };
+    }
+    if (name === 'teacherLogin') {
+      if (args[0] !== '2569demo') throw new Error('โหมดสาธิตใช้รหัส 2569demo');
+      return { token: 'demo-teacher' };
+    }
+    if (name === 'getTeacherDashboard') {
+      const filters = args[1] || {};
+      const names = ['ณัฐชา พิมพ์ดี','กิตติพงษ์ ใจงาม','ชนากานต์ รุ่งเรือง','ธีรภัทร วงศ์ทอง','ปภาวดี แสงจันทร์','ศุภกร จิตมั่น','ณิชาภัทร คำดี','ภูมิพัฒน์ เกษมสุข'];
+      const rows = names.map((fullName, i) => ({ submittedAt: new Date(Date.now() - i * 840000).toISOString(), studentId: `6904${String(i + 1).padStart(2,'0')}`, fullName, number: String(i + 3), room: i % 2 ? 'ม.4/4' : 'ม.4/3', setNumber: i % 5 + 1, score: 27 + i % 10, total: 40, percent: (27 + i % 10) * 2.5, durationSeconds: 1840 + i * 73, autoSubmitted: i === 5 }));
+      const query = String(filters.query || '').toLowerCase();
+      const filtered = rows.filter(row => (!filters.room || filters.room === 'all' || row.room === filters.room)
+        && (!Number(filters.setNumber) || row.setNumber === Number(filters.setNumber))
+        && (!query || `${row.studentId} ${row.fullName} ${row.number}`.toLowerCase().includes(query)));
+      const average = filtered.length ? filtered.reduce((sum, row) => sum + row.score, 0) / filtered.length : 0;
+      return { rows: filtered, summary: { shown: filtered.length, total: rows.length, average, autoSubmitted: filtered.filter(row => row.autoSubmitted).length }, syncedAt: new Date().toISOString() };
+    }
+    return { ok: true };
+  }
+
+  async function bootstrap() {
+    render();
+    if (!window.google?.script?.run && !IS_DEMO) {
+      state.screen = 'setup'; return render();
+    }
+    const token = localStorage.getItem(ATTEMPT_KEY);
+    if (token) {
+      try {
+        const response = await rpc('resumeExam', token);
+        if (response?.expired) {
+          state.result = response.result; state.screen = 'result'; localStorage.removeItem(ATTEMPT_KEY); return render();
+        }
+        if (response) return enterAttempt(response);
+        localStorage.removeItem(ATTEMPT_KEY);
+      } catch (error) {
+        localStorage.removeItem(ATTEMPT_KEY);
+      }
+    }
+    if (state.teacherToken) {
+      state.screen = 'admin';
+      await loadDashboard(true);
+      return;
+    }
+    state.screen = 'login';
+    render();
+  }
+
+  bootstrap();
+})();
+
+</script>
+
