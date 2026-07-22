@@ -20,12 +20,13 @@
 | ไฟล์ในโฟลเดอร์ | ชื่อไฟล์ใน Apps Script | หน้าที่ |
 | --- | --- | --- |
 | `Code.gs` | `Code.gs` | API, สุ่มข้อสอบ, ตรวจคะแนน, Google Sheet, สิทธิ์ครู |
+| `Questions.gs` | `Questions.gs` | คลังข้อสอบ 5 ชุดและตัวเลือก |
 | `index.html` | `index.html` | โครงหน้าเว็บและ template includes |
 | `style.html` | `style.html` | CSS ที่ใช้ใน Web App |
 | `app.html` | `app.html` | JavaScript ฝั่งผู้ใช้ |
 | `appsscript.json` | `appsscript.json` | manifest และ timezone |
 
-`app.js` และ `style.css` เป็นไฟล์ต้นฉบับสำหรับทดสอบหน้าจอในเครื่อง โดยเนื้อหาตรงกับ `app.html` และ `style.html`
+`app.js` และ `style.css` ใช้ทดสอบหน้าจอในเครื่อง โดยเนื้อหาตรงกับ `app.html` และ `style.html`
 
 ## วิธีติดตั้ง
 

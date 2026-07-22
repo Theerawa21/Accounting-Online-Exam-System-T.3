@@ -1,0 +1,6 @@
+*.xlsx
+backup-*/
+.DS_Store
+Thumbs.db
+app.readable.js
+
