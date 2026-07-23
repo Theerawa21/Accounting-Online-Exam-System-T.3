@@ -7,6 +7,9 @@
   const VIOLATION_KEY = 'accountingExamIntegrityState';
   const MAX_VIOLATIONS = 3;
   const HIDDEN_GRACE_MS = 2000;
+  const APPS_SCRIPT_API_URL = 'https://script.google.com/macros/s/AKfycbziPXKjD5YxP8hr98HP04bDOwXCPMLTEARRuwt9WI7obW2uVFLiefH-A7H9AG2Jejzj/exec';
+  const RPC_CHANNEL = 'accounting-exam-rpc-v1';
+  const HAS_REMOTE_API = /^https:\/\/script\.google\.com\/macros\/s\//.test(APPS_SCRIPT_API_URL);
   const IS_DEMO = !window.google?.script?.run && new URLSearchParams(location.search).get('demo') === '1';
   const state = {
     screen: 'boot', attempt: null, answers: {}, index: 0, result: null,
@@ -24,6 +27,18 @@
   let hiddenStartedAt = 0;
   let integrityIgnoreUntil = 0;
   let forcedSubmitTimer = 0;
+  const pendingRemoteCalls = new Map();
+
+  window.addEventListener('message', event => {
+    if (!isTrustedApiOrigin(event.origin) || event.data?.channel !== RPC_CHANNEL) return;
+    const pending = pendingRemoteCalls.get(String(event.data.requestId || ''));
+    if (!pending) return;
+    pendingRemoteCalls.delete(event.data.requestId);
+    clearTimeout(pending.timeoutId);
+    pending.frame.remove();
+    if (event.data.ok) pending.resolve(event.data.result);
+    else pending.reject(new Error(event.data.error || 'ไม่สามารถเชื่อมต่อฐานข้อมูลได้'));
+  });
 
   const icons = {
     clock: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
@@ -698,10 +713,65 @@
 
   function rpc(name, ...args) {
     if (IS_DEMO) return mockRpc(name, ...args);
-    if (!window.google?.script?.run) return Promise.reject(new Error('กรุณาเปิดระบบผ่าน URL ของ Google Apps Script Web App'));
+    if (window.google?.script?.run) {
+      return new Promise((resolve, reject) => {
+        const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+        runner[name](...args);
+      });
+    }
+    if (HAS_REMOTE_API) return remoteRpc(name, args);
+    return Promise.reject(new Error('ยังไม่ได้ตั้งค่า URL สำหรับเชื่อมต่อฐานข้อมูล'));
+  }
+
+  function isTrustedApiOrigin(origin) {
+    try {
+      const host = new URL(origin).hostname.toLowerCase();
+      return host === 'script.google.com' || host === 'script.googleusercontent.com' || host.endsWith('.googleusercontent.com');
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function remoteRpc(name, args) {
     return new Promise((resolve, reject) => {
-      const runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
-      runner[name](...args);
+      const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const frameName = `accountingRpc_${requestId.replace(/[^a-zA-Z0-9]/g, '')}`;
+      const frame = document.createElement('iframe');
+      frame.name = frameName;
+      frame.title = 'การเชื่อมต่อฐานข้อมูล';
+      frame.hidden = true;
+      frame.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(frame);
+
+      const timeoutId = setTimeout(() => {
+        pendingRemoteCalls.delete(requestId);
+        frame.remove();
+        reject(new Error('การเชื่อมต่อฐานข้อมูลใช้เวลานานเกินไป กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่'));
+      }, 45000);
+      pendingRemoteCalls.set(requestId, { resolve, reject, timeoutId, frame });
+
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = APPS_SCRIPT_API_URL;
+      form.target = frameName;
+      form.acceptCharset = 'UTF-8';
+      form.hidden = true;
+      const fields = {
+        action: name,
+        requestId,
+        parentOrigin: location.origin,
+        payload: JSON.stringify(args)
+      };
+      Object.entries(fields).forEach(([fieldName, value]) => {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = fieldName;
+        input.value = value;
+        form.appendChild(input);
+      });
+      document.body.appendChild(form);
+      form.submit();
+      form.remove();
     });
   }
 
@@ -774,7 +844,7 @@
 
   async function bootstrap() {
     render();
-    if (!window.google?.script?.run && !IS_DEMO) {
+    if (!window.google?.script?.run && !IS_DEMO && !HAS_REMOTE_API) {
       state.screen = 'setup'; return render();
     }
     const token = localStorage.getItem(ATTEMPT_KEY);

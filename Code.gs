@@ -22,6 +22,53 @@ function doGet() {
     .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
 }
 
+function doPost(e) {
+  const requestId = String(e && e.parameter && e.parameter.requestId || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80);
+  const parentOrigin = allowedParentOrigin_(e && e.parameter && e.parameter.parentOrigin);
+  let response;
+  try {
+    if (!parentOrigin) throw new Error('ไม่อนุญาตให้เชื่อมต่อจากเว็บไซต์นี้');
+    const action = String(e && e.parameter && e.parameter.action || '').trim();
+    const methods = {
+      lookupStudent: lookupStudent,
+      startExam: startExam,
+      resumeExam: resumeExam,
+      saveAnswers: saveAnswers,
+      submitExam: submitExam,
+      teacherLogin: teacherLogin,
+      getTeacherDashboard: getTeacherDashboard,
+      deleteStudentResult: deleteStudentResult,
+      setExamOpen: setExamOpen,
+      teacherLogout: teacherLogout,
+      recordExamViolation: recordExamViolation
+    };
+    if (!Object.prototype.hasOwnProperty.call(methods, action)) throw new Error('ไม่พบคำสั่งที่ร้องขอ');
+    const rawPayload = String(e && e.parameter && e.parameter.payload || '[]');
+    if (rawPayload.length > 500000) throw new Error('ข้อมูลที่ส่งมีขนาดใหญ่เกินกำหนด');
+    const args = JSON.parse(rawPayload);
+    if (!Array.isArray(args)) throw new Error('รูปแบบข้อมูลไม่ถูกต้อง');
+    response = { channel: 'accounting-exam-rpc-v1', requestId: requestId, ok: true, result: methods[action].apply(null, args) };
+  } catch (error) {
+    response = { channel: 'accounting-exam-rpc-v1', requestId: requestId, ok: false, error: error && error.message ? error.message : String(error) };
+  }
+  return rpcHtmlResponse_(response, parentOrigin || 'https://theerawa21.github.io');
+}
+
+function allowedParentOrigin_(origin) {
+  origin = String(origin || '').toLowerCase().replace(/\/$/, '');
+  if (origin === 'https://theerawa21.github.io') return origin;
+  if (/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return origin;
+  return '';
+}
+
+function rpcHtmlResponse_(response, parentOrigin) {
+  const payload = JSON.stringify(response).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  const target = JSON.stringify(parentOrigin);
+  const html = '<!doctype html><html><head><meta charset="UTF-8"></head><body>' +
+    '<script>window.top.postMessage(' + payload + ',' + target + ');</script></body></html>';
+  return HtmlService.createHtmlOutput(html).setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
 function include(filename) {
   return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
