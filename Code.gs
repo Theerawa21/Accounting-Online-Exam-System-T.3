@@ -15,7 +15,8 @@ const DELETED_RESULT_HEADERS = ['เวลาที่ลบโดยครู']
 const ATTEMPT_HEADERS = ['Attempt Token','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','เวลาเริ่ม','กำหนดส่ง','คำตอบ JSON','สถานะ','เวลาส่ง','บันทึกล่าสุด','เวลาที่ใช้ (วินาที)','จำนวนออกจากหน้าสอบ','บันทึกเหตุผิดปกติ JSON'];
 const ROSTER_HEADERS = ['เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','สถานะ'];
 
-function doGet() {
+function doGet(e) {
+  if (e && e.parameter && e.parameter.api === '1') return rpcScriptResponse_(e);
   return HtmlService.createTemplateFromFile('index')
     .evaluate()
     .setTitle('Accounting Fundamentals Online Examination System')
@@ -23,11 +24,26 @@ function doGet() {
 }
 
 function doPost(e) {
-  const requestId = String(e && e.parameter && e.parameter.requestId || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80);
   const parentOrigin = allowedParentOrigin_(e && e.parameter && e.parameter.parentOrigin);
-  let response;
+  const response = parentOrigin
+    ? handleRpcRequest_(e)
+    : rpcError_(e, new Error('ไม่อนุญาตให้เชื่อมต่อจากเว็บไซต์นี้'));
+  return rpcHtmlResponse_(response, parentOrigin || 'https://theerawa21.github.io');
+}
+
+function rpcScriptResponse_(e) {
+  const callback = String(e && e.parameter && e.parameter.callback || '');
+  if (!/^[A-Za-z_$][0-9A-Za-z_$]{0,80}$/.test(callback)) {
+    return ContentService.createTextOutput('/* callback ไม่ถูกต้อง */')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(callback + '(' + rpcJson_(handleRpcRequest_(e)) + ');')
+    .setMimeType(ContentService.MimeType.JAVASCRIPT);
+}
+
+function handleRpcRequest_(e) {
+  const requestId = rpcRequestId_(e);
   try {
-    if (!parentOrigin) throw new Error('ไม่อนุญาตให้เชื่อมต่อจากเว็บไซต์นี้');
     const action = String(e && e.parameter && e.parameter.action || '').trim();
     const methods = {
       lookupStudent: lookupStudent,
@@ -44,14 +60,30 @@ function doPost(e) {
     };
     if (!Object.prototype.hasOwnProperty.call(methods, action)) throw new Error('ไม่พบคำสั่งที่ร้องขอ');
     const rawPayload = String(e && e.parameter && e.parameter.payload || '[]');
-    if (rawPayload.length > 500000) throw new Error('ข้อมูลที่ส่งมีขนาดใหญ่เกินกำหนด');
+    if (rawPayload.length > 12000) throw new Error('ข้อมูลที่ส่งมีขนาดใหญ่เกินกำหนด');
     const args = JSON.parse(rawPayload);
     if (!Array.isArray(args)) throw new Error('รูปแบบข้อมูลไม่ถูกต้อง');
-    response = { channel: 'accounting-exam-rpc-v1', requestId: requestId, ok: true, result: methods[action].apply(null, args) };
+    return { channel: 'accounting-exam-rpc-v1', requestId: requestId, ok: true, result: methods[action].apply(null, args) };
   } catch (error) {
-    response = { channel: 'accounting-exam-rpc-v1', requestId: requestId, ok: false, error: error && error.message ? error.message : String(error) };
+    return rpcError_(e, error);
   }
-  return rpcHtmlResponse_(response, parentOrigin || 'https://theerawa21.github.io');
+}
+
+function rpcRequestId_(e) {
+  return String(e && e.parameter && e.parameter.requestId || '').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 80);
+}
+
+function rpcError_(e, error) {
+  return {
+    channel: 'accounting-exam-rpc-v1',
+    requestId: rpcRequestId_(e),
+    ok: false,
+    error: error && error.message ? error.message : String(error)
+  };
+}
+
+function rpcJson_(response) {
+  return JSON.stringify(response).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 function allowedParentOrigin_(origin) {
@@ -62,7 +94,7 @@ function allowedParentOrigin_(origin) {
 }
 
 function rpcHtmlResponse_(response, parentOrigin) {
-  const payload = JSON.stringify(response).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  const payload = rpcJson_(response);
   const target = JSON.stringify(parentOrigin);
   const html = '<!doctype html><html><head><meta charset="UTF-8"></head><body>' +
     '<script>window.top.postMessage(' + payload + ',' + target + ');</script></body></html>';
@@ -445,13 +477,23 @@ function validateStudent_(payload) {
 }
 
 function findRosterStudent_(studentId) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'roster:' + String(studentId);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    if (cached === 'null') return null;
+    try { return JSON.parse(cached); } catch (error) {}
+  }
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   const sheet = ss.getSheetByName(CONFIG.ROSTER_SHEET);
   if (!sheet || sheet.getLastRow() < 2) return null;
   const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, ROSTER_HEADERS.length).getDisplayValues();
   const id = String(studentId);
   const row = rows.find(values => clean_(values[0], 20) === id);
-  if (!row) return null;
+  if (!row) {
+    cache.put(cacheKey, 'null', 300);
+    return null;
+  }
   const student = {
     studentId: clean_(row[0], 20),
     fullName: clean_(row[1], 120),
@@ -461,15 +503,19 @@ function findRosterStudent_(studentId) {
   if (student.fullName.length < 4 || !/^[0-9]{1,3}$/.test(student.number)) return null;
   if (['ม.4/3','ม.4/4'].indexOf(student.room) === -1) return null;
   if (row[4] && ['กำลังศึกษาอยู่','นักเรียนเข้าใหม่','active'].indexOf(clean_(row[4], 40).toLowerCase()) === -1) return null;
+  cache.put(cacheKey, JSON.stringify(student), 3600);
   return student;
 }
 
 function getContext_() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const results = ss.getSheetByName(CONFIG.RESULTS_SHEET);
+  const attempts = ss.getSheetByName(CONFIG.ATTEMPTS_SHEET);
+  if (!results || !attempts) throw new Error('ระบบฐานข้อมูลยังไม่พร้อม กรุณาให้ครูรัน setupSystem()');
   return {
     ss: ss,
-    results: ensureSheet_(ss, CONFIG.RESULTS_SHEET, RESULT_HEADERS),
-    attempts: ensureSheet_(ss, CONFIG.ATTEMPTS_SHEET, ATTEMPT_HEADERS)
+    results: results,
+    attempts: attempts
   };
 }
 
