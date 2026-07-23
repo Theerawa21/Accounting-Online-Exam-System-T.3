@@ -1,6 +1,7 @@
 const CONFIG = Object.freeze({
   SPREADSHEET_ID: 'PUT_YOUR_SPREADSHEET_ID_HERE',
   RESULTS_SHEET: 'ผลสอบ',
+  DELETED_RESULTS_SHEET: 'ผลสอบที่ลบ',
   ATTEMPTS_SHEET: 'คำตอบชั่วคราว',
   ROSTER_SHEET: 'ทะเบียนนักเรียน',
   EXAM_MINUTES: 40,
@@ -9,8 +10,9 @@ const CONFIG = Object.freeze({
   INITIAL_TEACHER_PIN: 'CHANGE-ME-2569'
 });
 
-const RESULT_HEADERS = ['วันเวลาส่ง','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','คะแนน','คะแนนเต็ม','ร้อยละ','เวลาที่ใช้ (วินาที)','ส่งอัตโนมัติ','Attempt Token'];
-const ATTEMPT_HEADERS = ['Attempt Token','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','เวลาเริ่ม','กำหนดส่ง','คำตอบ JSON','สถานะ','เวลาส่ง','บันทึกล่าสุด','เวลาที่ใช้ (วินาที)'];
+const RESULT_HEADERS = ['วันเวลาส่ง','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','คะแนน','คะแนนเต็ม','ร้อยละ','เวลาที่ใช้ (วินาที)','ส่งอัตโนมัติ','Attempt Token','จำนวนออกจากหน้าสอบ','เหตุผลส่ง'];
+const DELETED_RESULT_HEADERS = ['เวลาที่ลบโดยครู'].concat(RESULT_HEADERS);
+const ATTEMPT_HEADERS = ['Attempt Token','เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','ชุดข้อสอบ','เวลาเริ่ม','กำหนดส่ง','คำตอบ JSON','สถานะ','เวลาส่ง','บันทึกล่าสุด','เวลาที่ใช้ (วินาที)','จำนวนออกจากหน้าสอบ','บันทึกเหตุผิดปกติ JSON'];
 const ROSTER_HEADERS = ['เลขประจำตัว','ชื่อ–นามสกุล','เลขที่','ห้อง','สถานะ'];
 
 function doGet() {
@@ -34,11 +36,13 @@ function setupSystem() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
   ss.setSpreadsheetTimeZone('Asia/Bangkok');
   const results = ensureSheet_(ss, CONFIG.RESULTS_SHEET, RESULT_HEADERS);
+  ensureSheet_(ss, CONFIG.DELETED_RESULTS_SHEET, DELETED_RESULT_HEADERS);
   const attempts = ensureSheet_(ss, CONFIG.ATTEMPTS_SHEET, ATTEMPT_HEADERS);
   const roster = ensureSheet_(ss, CONFIG.ROSTER_SHEET, ROSTER_HEADERS);
   attempts.hideSheet();
   const props = PropertiesService.getScriptProperties();
   if (!props.getProperty('TEACHER_PIN_HASH')) setTeacherPin_(CONFIG.INITIAL_TEACHER_PIN);
+  if (!props.getProperty('EXAM_OPEN')) props.setProperty('EXAM_OPEN', '1');
   props.setProperty('SYSTEM_READY', new Date().toISOString());
   return { ok: true, spreadsheetUrl: ss.getUrl(), resultSheet: results.getName(), rosterSheet: roster.getName() };
 }
@@ -74,13 +78,17 @@ function startExam(payload) {
       return attemptResponse_(active);
     }
 
+    if (!isExamOpen_()) {
+      throw new Error('ขณะนี้ครูปิดรับการสอบ กรุณารอประกาศจากครูผู้สอน');
+    }
+
     const token = Utilities.getUuid();
     const setNumber = 1 + (positiveHash_(student.studentId + ':' + token) % 5);
     const startedAt = new Date();
     const deadline = new Date(startedAt.getTime() + CONFIG.EXAM_MINUTES * 60000);
     ctx.attempts.appendRow([
       token, student.studentId, student.fullName, student.number, student.room, setNumber,
-      startedAt, deadline, '{}', 'กำลังสอบ', '', startedAt, 0
+      startedAt, deadline, '{}', 'กำลังสอบ', '', startedAt, 0, 0, '[]'
     ]);
     return attemptResponse_({
       token, studentId: student.studentId, fullName: student.fullName, number: student.number,
@@ -126,7 +134,26 @@ function saveAnswers(token, answers) {
   }
 }
 
-function submitExam(token, answers, autoSubmitted) {
+function recordExamViolation(token, detail) {
+  token = clean_(token, 80);
+  detail = detail || {};
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const ctx = getContext_();
+    const attempt = findAttemptByToken_(ctx.attempts, token);
+    if (!attempt || attempt.status !== 'กำลังสอบ') throw new Error('ไม่พบข้อมูลการสอบที่กำลังทำ');
+    const nextCount = Math.min(3, Math.max(attempt.violationCount, Number(detail.count || attempt.violationCount + 1)));
+    const log = Array.isArray(attempt.violationLog) ? attempt.violationLog.slice(-19) : [];
+    log.push({ type: clean_(detail.type || 'page_hidden', 40), occurredAt: clean_(detail.occurredAt || new Date().toISOString(), 40), durationMs: Math.max(0, Math.min(3600000, Number(detail.durationMs || 0))) });
+    ctx.attempts.getRange(attempt.row, 14, 1, 2).setValues([[nextCount, JSON.stringify(log)]]);
+    return { ok: true, count: nextCount };
+  } finally {
+    if (lock.hasLock()) lock.releaseLock();
+  }
+}
+
+function submitExam(token, answers, autoSubmitted, metadata) {
   token = clean_(token, 80);
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
@@ -153,10 +180,13 @@ function submitExam(token, answers, autoSubmitted) {
       Math.round((submittedAt.getTime() - attempt.startedAt.getTime()) / 1000)
     ));
     const percent = score / CONFIG.QUESTION_COUNT * 100;
+    metadata = metadata || {};
+    const violationCount = Math.max(attempt.violationCount, Math.min(3, Number(metadata.violationCount || 0)));
+    const submissionReason = clean_(metadata.reason || (autoSubmitted === true ? 'time' : 'manual'), 40);
     const row = [
       submittedAt, attempt.studentId, attempt.fullName, attempt.number, attempt.room,
       attempt.setNumber, score, CONFIG.QUESTION_COUNT, percent, duration,
-      autoSubmitted === true ? 'ใช่' : 'ไม่ใช่', token
+      autoSubmitted === true ? 'ใช่' : 'ไม่ใช่', token, violationCount, submissionReason
     ];
     ctx.results.appendRow(row);
     ctx.attempts.getRange(attempt.row, 9, 1, 5).setValues([[
@@ -173,7 +203,9 @@ function submitExam(token, answers, autoSubmitted) {
       percent: percent,
       durationSeconds: duration,
       submittedAt: submittedAt.toISOString(),
-      autoSubmitted: autoSubmitted === true
+      autoSubmitted: autoSubmitted === true,
+      violationCount: violationCount,
+      submissionReason: submissionReason
     };
   } finally {
     lock.releaseLock();
@@ -222,9 +254,54 @@ function getTeacherDashboard(token, filters) {
   const autoCount = rows.filter(function(r) { return r.autoSubmitted; }).length;
   return {
     rows: rows,
-    summary: { shown: rows.length, total: allCount, average: avg, autoSubmitted: autoCount },
+    summary: { shown: rows.length, total: allCount, average: avg, autoSubmitted: autoCount,
+      flagged: rows.filter(function(r) { return r.violationCount > 0; }).length },
+    examOpen: isExamOpen_(),
     syncedAt: new Date().toISOString()
   };
+}
+
+function setExamOpen(token, open) {
+  requireTeacher_(token);
+  const examOpen = open === true;
+  PropertiesService.getScriptProperties().setProperty('EXAM_OPEN', examOpen ? '1' : '0');
+  return { ok: true, examOpen: examOpen, updatedAt: new Date().toISOString() };
+}
+
+function deleteStudentResult(token, studentId) {
+  requireTeacher_(token);
+  studentId = clean_(studentId, 20);
+  if (!studentId) throw new Error('กรุณาระบุเลขประจำตัวนักเรียน');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const results = ensureSheet_(ss, CONFIG.RESULTS_SHEET, RESULT_HEADERS);
+    const deletedResults = ensureSheet_(ss, CONFIG.DELETED_RESULTS_SHEET, DELETED_RESULT_HEADERS);
+    const lastRow = results.getLastRow();
+    if (lastRow < 2) throw new Error('ไม่พบผลสอบของนักเรียนรายการนี้');
+
+    const values = results.getRange(2, 1, lastRow - 1, RESULT_HEADERS.length).getValues();
+    const rowsToDelete = [];
+    const deletedAt = new Date();
+    const archiveRows = [];
+    values.forEach(function(row, index) {
+      if (String(row[1]).trim() === studentId) {
+        rowsToDelete.push(index + 2);
+        archiveRows.push([deletedAt].concat(row));
+      }
+    });
+    if (!rowsToDelete.length) throw new Error('ไม่พบผลสอบของนักเรียนรายการนี้');
+
+    deletedResults.getRange(deletedResults.getLastRow() + 1, 1, archiveRows.length, DELETED_RESULT_HEADERS.length).setValues(archiveRows);
+    rowsToDelete.sort(function(a, b) { return b - a; }).forEach(function(rowNumber) {
+      results.deleteRow(rowNumber);
+    });
+    return { ok: true, deleted: rowsToDelete.length, studentId: studentId, deletedAt: deletedAt.toISOString() };
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function teacherLogout(token) {
@@ -248,6 +325,7 @@ function attemptResponse_(attempt) {
     startedAt: attempt.startedAt instanceof Date ? attempt.startedAt.toISOString() : new Date(attempt.startedAt).toISOString(),
     deadline: attempt.deadline instanceof Date ? attempt.deadline.toISOString() : new Date(attempt.deadline).toISOString(),
     answers: attempt.answers || {},
+    violationCount: Number(attempt.violationCount || 0),
     questions: questions,
     durationMinutes: CONFIG.EXAM_MINUTES
   };
@@ -365,6 +443,8 @@ function ensureSheet_(ss, name, headers) {
     sheet.getRange(1, 1, 1, headers.length)
       .setBackground('#082B5C').setFontColor('#FFFFFF').setFontWeight('bold');
     sheet.autoResizeColumns(1, headers.length);
+  } else {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   }
   return sheet;
 }
@@ -391,7 +471,8 @@ function attemptObject_(v, row) {
     row: row, token: String(v[0]), studentId: String(v[1]), fullName: String(v[2]),
     number: String(v[3]), room: String(v[4]), setNumber: Number(v[5]),
     startedAt: new Date(v[6]), deadline: new Date(v[7]), answers: answers,
-    status: String(v[9] || ''), submittedAt: v[10] ? new Date(v[10]) : null
+    status: String(v[9] || ''), submittedAt: v[10] ? new Date(v[10]) : null,
+    violationCount: Number(v[13] || 0), violationLog: parseJsonArray_(v[14])
   };
 }
 
@@ -419,7 +500,8 @@ function resultObject_(v) {
     studentId: String(v[1]), fullName: String(v[2]), number: String(v[3]),
     room: String(v[4]), setNumber: Number(v[5]), score: Number(v[6]),
     total: Number(v[7]), percent: Number(v[8]), durationSeconds: Number(v[9]),
-    autoSubmitted: String(v[10]) === 'ใช่', token: String(v[11])
+    autoSubmitted: String(v[10]) === 'ใช่', token: String(v[11]),
+    violationCount: Number(v[12] || 0), submissionReason: String(v[13] || '')
   };
 }
 
@@ -428,13 +510,28 @@ function resultResponse_(row) {
     studentId: row.studentId, fullName: row.fullName, number: row.number, room: row.room,
     setNumber: row.setNumber, score: row.score, total: row.total, percent: row.percent,
     durationSeconds: row.durationSeconds, submittedAt: row.submittedAt,
-    autoSubmitted: row.autoSubmitted
+    autoSubmitted: row.autoSubmitted,
+    violationCount: row.violationCount,
+    submissionReason: row.submissionReason
   };
 }
 
+function parseJsonArray_(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error) {
+    return [];
+  }
+}
+
 function setTeacherPin_(pin) {
-  if (!pin || String(pin).length < 8) throw new Error('รหัสครูต้องมีอย่างน้อย 8 ตัวอักษร');
+  if (!pin || String(pin).length < 6) throw new Error('รหัสครูต้องมีอย่างน้อย 6 ตัวอักษร');
   PropertiesService.getScriptProperties().setProperty('TEACHER_PIN_HASH', hashPin_(String(pin)));
+}
+
+function isExamOpen_() {
+  return PropertiesService.getScriptProperties().getProperty('EXAM_OPEN') !== '0';
 }
 
 function hashPin_(pin) {
@@ -458,4 +555,3 @@ function requireTeacher_(token) {
 function clean_(value, maxLength) {
   return String(value == null ? '' : value).replace(/[<>]/g, '').trim().slice(0, maxLength);
 }
-
